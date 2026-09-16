@@ -178,7 +178,7 @@ body{
   var curL = 0, curR = 0, curBrake = 0;
   var scale = 1;
   var modeScale = 1;
-  var ok = true;
+  var ws = null, retryTimer = 0, lastSent = '';
 
   /* ---- sizing ---- */
   function recalc(){
@@ -190,19 +190,31 @@ body{
   window.addEventListener('resize', recalc);
   recalc();
 
-  /* ---- network ---- */
+  /* One persistent socket; only the latest state is sent. Never queue old moves. */
+  function connection(ready){
+    dot.className = ready ? 'dot' : 'dot off';
+    sts.textContent = ready ? '已连接' : '连接断开';
+  }
+  function connect(){
+    if(document.hidden) return;
+    ws = new WebSocket('ws://' + location.hostname + ':81/');
+    ws.onopen = function(){ connection(true); lastSent = ''; transmit(true); };
+    ws.onclose = function(){ connection(false); ws = null; retryTimer = setTimeout(connect, 500); };
+    ws.onerror = function(){ ws.close(); };
+  }
+  function transmit(force){
+    if(!ws || ws.readyState !== WebSocket.OPEN || ws.bufferedAmount) return;
+    var frame = curL + ',' + curR + ',' + curBrake;
+    if(force || frame !== lastSent || active || curBrake){
+      ws.send(frame);
+      lastSent = frame;
+    }
+  }
   function send(l, r, b){
     curL = l; curR = r; curBrake = b;
-    fetch('/cmd',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:'{"l":'+l+',"r":'+r+',"brake":'+b+'}'
-    }).then(function(r){
-      if(!ok){ ok=true; dot.className='dot'; sts.textContent='已连接'; }
-    }).catch(function(){
-      if(ok){ ok=false; dot.className='dot off'; sts.textContent='连接断开'; }
-    });
+    transmit(true);
   }
+  connect();
 
   /* ---- joystick math ---- */
   function calc(dx, dy){
@@ -251,7 +263,7 @@ body{
     var t = ptr(e);
     var m = calc(t.clientX - cx, cy - t.clientY);
     show(m);
-    send(m.l, m.r, 0);
+    curL=m.l; curR=m.r; curBrake=0;
   }
   function onUp(){
     if(!active) return; active = false;
@@ -259,9 +271,6 @@ body{
     resetKnob();
     curL=0; curR=0;
     send(0, 0, 0);
-    /* keep sending stop for a short while to prevent safety timeout */
-    var stopInterval = setInterval(function(){ send(0,0,0); }, 200);
-    setTimeout(function(){ clearInterval(stopInterval); }, 600);
   }
 
   base.addEventListener('touchstart',  onDown, {passive:false});
@@ -278,10 +287,13 @@ body{
   var brakeHeld = false;
   function brakeOn(e){ 
     e.preventDefault(); 
+    active = false;
+    resetKnob();
     brakeHeld = true;
     send(0,0,1); 
   }
-  function brakeOff(){  
+  function brakeOff(){
+    if(!brakeHeld) return;
     brakeHeld = false;
     send(0,0,0); 
   }
@@ -293,10 +305,18 @@ body{
   bb.addEventListener('mouseup',    brakeOff);
   bb.addEventListener('mouseleave', brakeOff);
 
-  /* ---- heartbeat (re-send to prevent timeout) ---- */
+  /* 20 Hz keepalive while driving or braking; latest state only. */
   setInterval(function(){
-    if(active || curBrake) send(curL, curR, curBrake);
-  }, 200);
+    transmit(false);
+  }, 50);
+
+  document.addEventListener('visibilitychange', function(){
+    if(document.hidden){
+      active=false; brakeHeld=false; resetKnob(); send(0,0,1);
+      clearTimeout(retryTimer);
+      if(ws) ws.close();
+    } else if(!ws) connect();
+  });
 
   /* ---- speed mode ---- */
   window.setMode = function(s){
@@ -307,15 +327,6 @@ body{
     else if(s<=0.5) document.getElementById('mSlow').className='mode-btn on';
     else document.getElementById('mNorm').className='mode-btn on';
   };
-
-  /* ---- connection check ---- */
-  setInterval(function(){
-    fetch('/status').then(function(){
-      if(!ok){ ok=true; dot.className='dot'; sts.textContent='已连接'; }
-    }).catch(function(){
-      if(ok){ ok=false; dot.className='dot off'; sts.textContent='连接断开'; }
-    });
-  }, 5000);
 
 })();
 </script>

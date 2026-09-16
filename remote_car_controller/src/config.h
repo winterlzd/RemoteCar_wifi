@@ -18,8 +18,8 @@
 #define STM32_BAUD      115200
 
 /* ---- Safety ---- */
-#define CMD_TIMEOUT_MS  500             /* auto-brake if no cmd (was 300, too tight) */
-#define HEARTBEAT_MS    200             /* web-side keepalive (match user request) */
+#define CMD_TIMEOUT_MS  500             /* auto-brake if control frames stop */
+#define SERIAL_LOG_INTERVAL_MS 200       /* USB monitor: at most 5 control lines/s */
 #define PWM_MAX         255
 
 /* ---- LED ---- */

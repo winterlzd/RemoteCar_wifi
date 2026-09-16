@@ -11,17 +11,20 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <WebSocketsServer.h>
 #include "config.h"
 #include "webpage.h"
 
 /* ---- globals ---- */
 WebServer server(80);
+WebSocketsServer control(81);
 
 static volatile uint32_t lastCmdMs  = 0;
 static volatile bool     braked     = false;   /* prevent brake spam */
 static volatile int16_t  curL = 0, curR = 0;
 static volatile uint8_t  curBrake   = 0;
 static uint32_t          heartbeatMs = 0;
+static uint32_t          lastControlLogMs = 0;
 
 /* ============================================================
  *  UART bridge  →  STM32
@@ -35,51 +38,66 @@ static void sendToSTM32(int left, int right, int brake)
     char buf[32];
     int n = snprintf(buf, sizeof(buf), "M,%d,%d,%d\n", left, right, brake);
     STM32_SERIAL.write(buf, n);
-    Serial.printf("[TX→STM32] %s", buf);            // ← 调试：确认是否发出
+
+    /* USB monitor only. Keep logging bounded so it cannot slow the control loop. */
+    uint32_t now = millis();
+    if (Serial && now - lastControlLogMs >= SERIAL_LOG_INTERVAL_MS) {
+        lastControlLogMs = now;
+        Serial.printf("[CTRL] L=%d R=%d brake=%d\n", left, right, brake);
+    }
 
     curL      = (int16_t)left;
     curR      = (int16_t)right;
     curBrake  = (uint8_t)brake;
-    lastCmdMs = millis();
+    lastCmdMs = now;
     braked    = false;
 }
 
 /* ============================================================
- *  HTTP handlers
+ *  WebSocket control: one short frame per current joystick state.
+ * ============================================================ */
+static bool parseCommand(const uint8_t *payload, size_t length, int &l, int &r, int &brake)
+{
+    if (length == 0 || length > 16) return false;
+    char frame[17];
+    memcpy(frame, payload, length);
+    frame[length] = '\0';
+    char *end = nullptr;
+    long values[3];
+    char *pos = frame;
+    for (int i = 0; i < 3; ++i) {
+        values[i] = strtol(pos, &end, 10);
+        if (end == pos || (i < 2 ? *end != ',' : *end != '\0')) return false;
+        pos = end + 1;
+    }
+    if (values[0] < -PWM_MAX || values[0] > PWM_MAX ||
+        values[1] < -PWM_MAX || values[1] > PWM_MAX ||
+        (values[2] != 0 && values[2] != 1)) return false;
+    l = values[0]; r = values[1]; brake = values[2];
+    return true;
+}
+
+static void onControl(uint8_t client, WStype_t type, uint8_t *payload, size_t length)
+{
+    if (type == WStype_DISCONNECTED) {
+        sendToSTM32(0, 0, 1);
+        braked = true;
+    } else if (type == WStype_TEXT) {
+        int l, r, brake;
+        if (parseCommand(payload, length, l, r, brake)) {
+            sendToSTM32(l, r, brake);
+        }
+    }
+}
+
+/* ============================================================
+ *  HTTP handlers (page and optional status only)
  * ============================================================ */
 
 /* GET /  – serve gamepad page */
 static void handleRoot()
 {
     server.send_P(200, "text/html", HTML_PAGE);
-}
-
-/* POST /cmd – receive joystick command
- *  Body: {"l":180,"r":80,"brake":0}
- */
-static void handleCmd()
-{
-    if (server.method() != HTTP_POST) {
-        server.send(405, "application/json", "{\"err\":\"POST only\"}");
-        return;
-    }
-
-    String body = server.arg("plain");
-    int l = 0, r = 0, brk = 0;
-
-    /* lightweight JSON parse (no ArduinoJson dependency) */
-    int idx;
-    idx = body.indexOf("\"l\":");
-    if (idx >= 0) l = body.substring(idx + 4).toInt();
-
-    idx = body.indexOf("\"r\":");
-    if (idx >= 0) r = body.substring(idx + 4).toInt();
-
-    idx = body.indexOf("\"brake\":");
-    if (idx >= 0) brk = body.substring(idx + 7).toInt();
-
-    sendToSTM32(l, r, brk);
-    server.send(200, "application/json", "{\"ok\":1}");
 }
 
 /* GET /status – lightweight health check */
@@ -90,15 +108,6 @@ static void handleStatus()
              "{\"up\":%lu,\"l\":%d,\"r\":%d}",
              (unsigned long)(millis() / 1000), (int)curL, (int)curR);
     server.send(200, "application/json", buf);
-}
-
-/* handle CORS preflight if browser sends OPTIONS */
-static void handleOptions()
-{
-    server.sendHeader("Access-Control-Allow-Origin",  "*");
-    server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-    server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
-    server.send(204);
 }
 
 /* ============================================================
@@ -157,11 +166,11 @@ void setup()
 
     /* Web server routes */
     server.on("/",       HTTP_GET,     handleRoot);
-    server.on("/cmd",    HTTP_POST,    handleCmd);
     server.on("/status", HTTP_GET,     handleStatus);
-    server.on("/cmd",    HTTP_OPTIONS, handleOptions);
     server.begin();
-    Serial.println("[HTTP] Server started on port 80");
+    control.begin();
+    control.onEvent(onControl);
+    Serial.println("[HTTP] page on port 80; control on WebSocket port 81");
 
     /* send initial brake to STM32 */
     sendToSTM32(0, 0, 1);
@@ -175,6 +184,7 @@ void setup()
 void loop()
 {
     server.handleClient();
+    control.loop();
 
     /* ---- safety: auto-brake on timeout ---- */
     if (!braked && (millis() - lastCmdMs > CMD_TIMEOUT_MS)) {
